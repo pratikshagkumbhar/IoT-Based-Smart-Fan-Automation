@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0F8B8D">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<title>Smart Fan</title>
+<style>
+:root{--bg:#E8EEF1;--card:#fff;--ink:#12232E;--mute:#5B6E7A;--on:#0F8B8D;--off:#9AA9B2;--bad:#C2410C}
+@media (prefers-color-scheme:dark){:root{--bg:#0E1A21;--card:#16262F;--ink:#E6EEF2;--mute:#8FA3AF;--off:#4C606B}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:env(safe-area-inset-top) 16px 120px}
+header{display:flex;justify-content:space-between;align-items:center;padding:20px 4px}
+h1{font-size:26px;margin:0;letter-spacing:-.02em}
+#status{font-size:14px;color:var(--mute);display:flex;align-items:center;gap:6px}
+#status i{width:9px;height:9px;border-radius:50%;background:var(--off);display:inline-block}
+#status.ok i{background:var(--on)} #status.err i{background:var(--bad)}
+.card{background:var(--card);border-radius:20px;padding:20px;margin-bottom:16px;max-width:480px;margin-inline:auto}
+.top{display:flex;justify-content:space-between;align-items:center}
+.name{font-weight:600;font-size:18px}
+.state{font-size:14px;color:var(--mute)}
+.fan{display:block;margin:12px auto;width:150px;height:150px;color:var(--off);transition:color .3s}
+.card.on .fan{color:var(--on)}
+.blades{transform-origin:50px 50px;animation:spin var(--dur,1s) linear infinite;animation-play-state:paused}
+.card.on .blades{animation-play-state:running}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.blades{animation:none}}
+.power{width:100%;padding:16px;font-size:18px;font-weight:600;border:0;border-radius:14px;background:var(--off);color:#fff;cursor:pointer}
+.card.on .power{background:var(--on)}
+.power:focus-visible,.mic:focus-visible,input:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+.row{display:flex;justify-content:space-between;margin:18px 0 6px;color:var(--mute);font-size:14px}
+input[type=range]{width:100%;accent-color:var(--on);height:32px}
+.empty{text-align:center;color:var(--mute);padding:40px 16px}
+footer{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--bg);text-align:center}
+.mic{padding:16px 28px;font-size:18px;font-weight:600;border:0;border-radius:999px;background:var(--ink);color:var(--bg);cursor:pointer}
+.mic.live{background:var(--bad);color:#fff}
+#heard{min-height:22px;margin-top:8px;color:var(--mute);font-size:14px}
+</style>
+</head>
+<body>
+<header><h1>Smart Fan</h1><div id="status"><i></i><span>Connecting</span></div></header>
+<main id="devices"></main>
+<footer>
+  <button class="mic" id="mic">Speak a command</button>
+  <div id="heard">Try: "fan on", "fan off", "fan high", "fan low"</div>
+</footer>
+
+<script>
+// Paste your Firebase Realtime Database URL here (no slash at the end)
+const DB = "https://smart-fan-ced42-default-rtdb.asia-southeast1.firebasedatabase.app";
+const MIN = 100, MAX = 255;   // motor does not start below ~100
+const $ = s => document.querySelector(s);
+let devices = {}, busy = 0;
+
+function setStatus(kind, text){ const s=$("#status"); s.className=kind; s.querySelector("span").textContent=text; }
+const pct = v => Math.round((v-MIN)/(MAX-MIN)*100);
+
+const FAN = `<svg class="fan" viewBox="0 0 100 100" aria-hidden="true"><g class="blades" fill="currentColor">
+<path d="M50 50 C40 30 45 8 50 8 C55 8 60 30 50 50Z"/><path d="M50 50 C70 40 92 45 92 50 C92 55 70 60 50 50Z"/>
+<path d="M50 50 C60 70 55 92 50 92 C45 92 40 70 50 50Z"/><path d="M50 50 C30 60 8 55 8 50 C8 45 30 40 50 50Z"/></g>
+<circle cx="50" cy="50" r="7" fill="var(--card)"/></svg>`;
+
+function ensureCard(id){
+  let el = document.getElementById("d-"+id);
+  if(el) return el;
+  el = document.createElement("section"); el.className="card"; el.id="d-"+id;
+  el.innerHTML = `<div class="top"><span class="name"></span><span class="state"></span></div>${FAN}
+  <button class="power"></button>
+  <div class="row"><label for="s-${id}">Speed</label><span class="val"></span></div>
+  <input type="range" id="s-${id}" min="${MIN}" max="${MAX}">`;
+  el.querySelector(".power").onclick = () => send(id, {power: devices[id].power ? 0 : 1});
+  const sl = el.querySelector("input");
+  sl.oninput = () => { el.querySelector(".val").textContent = pct(sl.value)+"%"; busy = Date.now(); };
+  sl.onchange = () => send(id, {speed: +sl.value});
+  $("#devices").appendChild(el); return el;
+}
+
+function render(){
+  const ids = Object.keys(devices);
+  if(!ids.length){ $("#devices").innerHTML='<p class="empty">No devices yet. In Firebase, add devices → fan1 with power and speed.</p>'; return; }
+  const empty = $("#devices .empty"); if(empty) empty.remove();
+  ids.forEach(id=>{
+    const d = devices[id], el = ensureCard(id), on = !!d.power, sp = +d.speed || MIN;
+    el.classList.toggle("on", on);
+    el.querySelector(".name").textContent = d.name || id;
+    el.querySelector(".state").textContent = on ? "Running" : "Off";
+    el.querySelector(".power").textContent = on ? "Turn off" : "Turn on";
+    el.querySelector(".blades").style.setProperty("--dur", (0.25 + (1 - pct(sp)/100) * 1.2).toFixed(2)+"s");
+    if(Date.now()-busy > 1500){ el.querySelector("input").value = sp; el.querySelector(".val").textContent = pct(sp)+"%"; }
+  });
+}
+
+async function poll(){
+  try{
+    const r = await fetch(DB+"/devices.json"); if(!r.ok) throw 0;
+    devices = (await r.json()) || {}; setStatus("ok","Online"); render();
+  }catch(e){ setStatus("err","Offline"); }
+}
+
+async function send(id, patch){
+  Object.assign(devices[id], patch); render();
+  try{
+    const r = await fetch(`${DB}/devices/${id}.json`, {method:"PATCH", body:JSON.stringify(patch)});
+    if(!r.ok) throw 0; setStatus("ok","Online");
+  }catch(e){ setStatus("err","Not saved, check internet"); }
+}
+
+// ---- Voice ----
+function findDevice(t){
+  const flat = t.replace(/\s+/g,"");
+  return Object.keys(devices).find(id => flat.includes(id.toLowerCase()) || flat.includes((devices[id].name||"").toLowerCase().replace(/\s+/g,""))) || Object.keys(devices)[0];
+}
+function handle(text){
+  const t = text.toLowerCase(), id = findDevice(t);
+  if(!id){ $("#heard").textContent = "No device found. Add one in Firebase first."; return; }
+  let msg;
+  if(/\b(high|full|fast|maximum)\b/.test(t)) { send(id,{power:1,speed:255}); msg="High speed"; }
+  else if(/\b(medium|middle|normal)\b/.test(t)) { send(id,{power:1,speed:180}); msg="Medium speed"; }
+  else if(/\b(low|slow)\b/.test(t)) { send(id,{power:1,speed:110}); msg="Low speed"; }
+  else if(/\b(off|stop)\b/.test(t)) { send(id,{power:0}); msg="Turned off"; }
+  else if(/\b(on|start)\b/.test(t)) { send(id,{power:1}); msg="Turned on"; }
+  else { $("#heard").textContent = `Heard "${text}". Say on, off, high, medium or low.`; return; }
+  $("#heard").textContent = `Heard "${text}" → ${msg}`;
+}
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const mic = $("#mic");
+if(!SR){ mic.disabled = true; mic.textContent = "Voice not supported here"; $("#heard").textContent = "Open in Chrome on Android or laptop for voice."; }
+else{
+  const rec = new SR(); rec.lang = "en-IN"; rec.interimResults = false;
+  rec.onstart = () => { mic.classList.add("live"); mic.textContent = "Listening…"; };
+  rec.onend = () => { mic.classList.remove("live"); mic.textContent = "Speak a command"; };
+  rec.onresult = e => handle(e.results[0][0].transcript);
+  rec.onerror = e => { $("#heard").textContent = e.error==="not-allowed" ? "Allow microphone access and try again." : "Voice error: "+e.error; };
+  mic.onclick = () => { try{ rec.start(); }catch(e){} };
+}
+
+poll(); setInterval(poll, 2000);
+if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
+</script>
+</body>
+</html>
